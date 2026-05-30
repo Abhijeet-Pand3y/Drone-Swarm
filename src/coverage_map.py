@@ -19,13 +19,17 @@ class CoverageMap:
         self.device = device
 
         self.grid_size = int(arena_size / cell_size)
-        self.grid = torch.zeros((self.num_envs, self.grid_size, self.grid_size), dtype=torch.bool, device=self.device)
+        # float scan-progress grid, 0.0 = untouched, 1.0 = fully scanned
+        self.grid = torch.zeros(
+            (self.num_envs, self.grid_size, self.grid_size),
+            dtype=torch.float, device=self.device
+        )
         self.cell_centers = self._compute_cell_centers()
 
-        self._batch_mask = torch.zeros(
+        # per-agent increment buffer is  float 
+        self._batch_progress = torch.zeros(
             (self.num_envs, self.grid_size, self.grid_size),
-            dtype=torch.uint8,
-            device=self.device
+            dtype=torch.float, device=self.device
         )
 
     def _compute_cell_centers(self) -> torch.Tensor:
@@ -45,7 +49,7 @@ class CoverageMap:
     
     
     def reset(self, env_ids: torch.Tensor):
-        self.grid[env_ids] = False
+        self.grid[env_ids] = 0.0
 
     def pos_to_cell(self, positions: torch.Tensor) -> torch.Tensor:
         """
@@ -60,31 +64,50 @@ class CoverageMap:
         cell_indices = torch.floor(pos_xy / self.cell_size).long()
         return cell_indices.clamp(0, self.grid_size - 1)
     
-    def mark_scanned(self, env_ids: torch.Tensor, positions: torch.Tensor, scan_range: float):
+    def mark_scanned(self, env_ids: torch.Tensor, positions: torch.Tensor,
+                 scan_range: float, scan_rate: float = 0.2, threshold=0.95):
         """
-        Mark cells within scan_range of each agent as scanned.
-        Multiple agents in the same env write to that env's shared grid.
+        Accumulate scan progress for cells within scan_range of each agent.
+        Cells gain `scan_rate` progress per step of presence, clamped at 1.0.
+
+        Multi-agent same cell: progress increment is the MAX across agents in that
+        env (presence-based — two drones over one cell don't scan it 2x faster;
+        coordinated co-scanning is out of scope). That max increment is added to
+        the running grid and clamped.
 
         Args:
             env_ids:    (num_agents_total,) — env index per agent
             positions:  (num_agents_total, 2 or 3) — agent world positions
             scan_range: float — physical scan radius in meters
+            scan_rate:  float — progress added per step of presence (default 0.2)
+        Returns:
+        progress_delta:   (num_envs,) total scan-progress added this step (clamp-accounted)
+        completion_count: (num_envs,) cells that newly reached `threshold` this step
         """
         pos_xy = positions[:, :2]
+        pos_expanded = pos_xy[:, None, None, :]
+        diff = self.cell_centers - pos_expanded
+        dist_sq = (diff ** 2).sum(dim=-1)
+        within_range = dist_sq <= (scan_range ** 2)
+        increments = within_range.float() * scan_rate
 
-        # distance from each agent to every cell center → (A, grid, grid)
-        pos_expanded = pos_xy[:, None, None, :]                    # (A, 1, 1, 2)
-        diff = self.cell_centers - pos_expanded                    # (A, grid, grid, 2)
-        dist_sq = (diff ** 2).sum(dim=-1)                          # (A, grid, grid)
-        within_range = dist_sq <= (scan_range ** 2)               # (A, grid, grid) bool
+        self._batch_progress.zero_()
+        self._batch_progress.index_reduce_(0, env_ids, increments, reduce="amax", include_self=True)
 
-        # accumulate each agent's mask into its env's grid slot
-        # reuse preallocated buffer — no per-step allocation
-        self._batch_mask.zero_()
-        self._batch_mask.index_put_((env_ids,), within_range.to(torch.uint8), accumulate=True)
+        # snapshot for delta accounting
+        grid_before = self.grid.clone()
+        completed_before = (grid_before >= threshold)
 
-        # OR the new scans into the master grid
-        self.grid |= (self._batch_mask > 0)
+        self.grid = (self.grid + self._batch_progress).clamp_(max=1.0)
+
+        # clamp-accounted progress actually added, per env
+        progress_delta = (self.grid - grid_before).sum(dim=(1, 2))          # (num_envs,)
+        # cells that newly crossed the threshold this step, per env
+        completed_after = (self.grid >= threshold)
+        newly_completed = completed_after & (~completed_before)
+        completion_count = newly_completed.sum(dim=(1, 2)).float()          # (num_envs,)
+
+        return progress_delta, completion_count
 
 
     def get_full_map(self, env_ids: torch.Tensor) -> torch.Tensor:
@@ -154,38 +177,27 @@ class CoverageMap:
 
         return pooled.reshape(num_agents_total, -1) 
     
-    def get_coverage_pct(self, env_ids: torch.Tensor | None = None) -> torch.Tensor:
+    def get_coverage_pct(self, env_ids: torch.Tensor | None = None,
+                     threshold: float = 0.95) -> torch.Tensor:
         """
-        Fraction of arena scanned.
-        
+        Fraction of cells considered COVERED (progress >= threshold).
+
         Args:
-            env_ids: (num_agents_total,) for per-agent output,
-                    or None for per-env output
+            env_ids:   (num_agents_total,) for per-agent, or None for per-env
+            threshold: progress level counting a cell as covered (default 0.95)
         Returns:
-            if env_ids given: (num_agents_total,) — each agent's env coverage
-            if None:          (num_envs,)         — per env
+            per-agent (num_agents_total,) or per-env (num_envs,)
         """
         total_cells = self.grid_size * self.grid_size
-        per_env = self.grid.sum(dim=(1, 2)).float() / total_cells   # (num_envs,)
-        
+        covered = (self.grid >= threshold).float()                  # CHANGED: threshold, not nonzero
+        per_env = covered.sum(dim=(1, 2)) / total_cells
+
         if env_ids is None:
             return per_env
-        return per_env[env_ids]   # (num_agents_total,)
+        return per_env[env_ids]
 
-    def is_fully_covered(self, env_ids: torch.Tensor | None = None, threshold: float = 0.95) -> torch.Tensor:
-        """
-        Check whether coverage has reached the completion threshold.
-
-        Args:
-            env_ids:   (num_agents_total,) for per-agent output,
-                    or None for per-env output (used by done conditions)
-            threshold: coverage fraction counting as complete (default 0.95)
-        Returns:
-            bool tensor — (num_agents_total,) if env_ids given, else (num_envs,)
-
-        NOTE: done conditions use the per-env form (env_ids=None) since mission
-        completion is an environment property. Per-agent form added for consistency
-        and Phase 2+ where perceived coverage differs per agent.
-        """
-        return self.get_coverage_pct(env_ids) >= threshold
+    def is_fully_covered(self, env_ids: torch.Tensor | None = None,
+                     threshold: float = 0.95) -> torch.Tensor:
+        """Check whether coverage (cells at/above threshold) meets the threshold fraction."""
+        return self.get_coverage_pct(env_ids, threshold=threshold) >= threshold
         

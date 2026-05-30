@@ -68,6 +68,7 @@ class MidLevelController:
         self.odometer = torch.zeros((num_envs, num_agents), dtype=torch.float, device=device)
         self.target = torch.zeros((num_envs, num_agents, 3), dtype=torch.float, device=device)
         self.prev_pos = torch.zeros((num_envs, num_agents, 3), dtype=torch.float, device=device)
+        self.dist_to_base = torch.zeros((num_envs, num_agents), dtype=torch.float, device=device)
 
 
     def reset(self, env_ids):
@@ -124,10 +125,19 @@ class MidLevelController:
 
         self.target = target
 
+        
         # --- 4. Arrival check: RETURNING → DOCKED ---
-        dist_to_base = torch.norm(current_pos - self.base_xyz, dim=-1)   # (num_envs, num_agents)
+        dist_to_base = torch.norm(current_pos - self.base_xyz, dim=-1)   # (num_envs, num_agents) 3D
         mask_docked = (self.mode == self.MODE_RETURNING) & (dist_to_base <= self.arrival_threshold)
         self.mode[mask_docked] = self.MODE_DOCKED
+
+        # store xy-only distance to base for the observation builder
+        # (vertical is mode-determined, not part of "how far to fly home";
+        #  a real impl can add a fixed buffer for the climb/descent)
+        base_xy = self.base_xyz[:2]                                       # (2,)
+        self.dist_to_base = torch.norm(
+            current_pos[..., :2] - base_xy, dim=-1
+        ) 
 
         # --- 5. Velocity setpoint toward target ---
         direction = target - current_pos                                 # (num_envs, num_agents, 3)
@@ -154,12 +164,18 @@ class MidLevelController:
                     else (len(env_ids), num_agents, 3)
             env_ids:   optional subset of envs being reset
         """
+        base_xy = self.base_xyz[:2]
         if env_ids is None:
             self.prev_pos = positions.clone()
             self.target = positions.clone()
+            self.dist_to_base = torch.norm(positions[..., :2] - base_xy, dim=-1)
         else:
             self.prev_pos[env_ids] = positions.clone()
             self.target[env_ids] = positions.clone()
+            self.dist_to_base[env_ids] = torch.norm(positions[..., :2] - base_xy, dim=-1)
+
+
+
 
     def mark_dead(self, dead_mask: torch.Tensor):                        
         """

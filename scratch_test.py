@@ -1,5 +1,5 @@
 import torch
-from controller.mid_level_controller import MidLevelController
+from SwarmProject.src.mid_level_controller import MidLevelController
 
 ctrl = MidLevelController(num_envs=4, num_agents=3,device="cuda:0")
 
