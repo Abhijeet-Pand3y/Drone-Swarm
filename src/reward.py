@@ -43,35 +43,45 @@ class RewardComputer:
         progress_delta,      # (A,) per-agent scan-progress added this step
         completion_count,    # (A,) per-agent cells newly completed this step
         modes,               # (A,) controller modes
-        # --- gated-term inputs, ignored while weights are 0 ---
-        wall_overshoot=None,    # (A,) how far raw_target exceeded arena (ACTIVE)
-        milestone_crossed=None, # (A,) bool, env crossed completion threshold this step
-        docked_contrib=None,    # (A,) bool, drone docked after contributing coverage
-        collision=None,         # (A,) collision signal (Phase 1+)
+        wall_overshoot=None,    # (A,) ACTIVE wall-push magnitude (gated)
+        milestone_crossed=None, # (A,) bool, env crossed completion threshold (gated)
+        docked_contrib=None,    # (A,) bool, docked after contributing (gated)
+        collision=None,         # (A,) collision signal (gated, Phase 1+)
     ) -> torch.Tensor:
         """
         All inputs per-agent flattened (A,). Returns (A,) reward.
 
-        Note: progress_delta / completion_count arrive per-AGENT here. The env is
-        responsible for mapping CoverageMap's per-ENV deltas to per-agent (Phase 0:
-        env delta -> its single agent; Phase 1: per-drone under Model 2).
+        Honest reward for ACTIVE / RETURNING / DOCKED; DEAD forced to 0.
+        Actor/critic loss masking is applied later in the training loop, not here.
         """
-        # TODO 1 — active terms
-        #   coverage = coverage_weight * progress_delta
-        #   completion = completion_weight * completion_count
-        #   time = time_penalty (subtract)
-        #   reward = coverage + completion - time
+        active = (modes == MLC.MODE_ACTIVE)
 
-        # TODO 2 — gated terms (each multiplied by its weight; 0 disables)
-        #   if wall_weight:      reward -= wall_weight * wall_overshoot
-        #   if milestone_weight: reward += milestone_weight * milestone_crossed
-        #   if safe_return:      reward += safe_return_weight * docked_contrib
-        #   if collision:        reward -= collision_weight * collision
-        #   (write these so a None input is safe when the weight is 0)
+        # --- active terms ---
+        # dense coverage: progress added this step
+        reward = self.coverage_weight * progress_delta
 
-        # TODO 3 — mask DEAD to zero reward
-        #   dead = modes == MLC.MODE_DEAD
-        #   reward[dead] = 0.0
+        # completion bonus: cells that crossed the threshold this step
+        reward = reward + self.completion_weight * completion_count
 
-        # return reward  # (A,)
-        pass
+        # time penalty: ACTIVE drones only (productive-urgency pressure;
+        # returning/docked drones aren't under scanning time pressure)
+        reward = reward - self.time_penalty * active.float()
+
+        # --- gated terms (each guarded so a None input is safe when weight is 0) ---
+        if self.wall_weight != 0.0:
+            reward = reward - self.wall_weight * wall_overshoot
+
+        if self.milestone_weight != 0.0:
+            reward = reward + self.milestone_weight * milestone_crossed.float()
+
+        if self.safe_return_weight != 0.0:
+            reward = reward + self.safe_return_weight * docked_contrib.float()
+
+        if self.collision_weight != 0.0:
+            reward = reward - self.collision_weight * collision
+
+        # --- DEAD gets zero reward ---
+        dead = (modes == MLC.MODE_DEAD)
+        reward = torch.where(dead, torch.zeros_like(reward), reward)
+
+        return reward
