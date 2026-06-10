@@ -41,7 +41,9 @@ class MidLevelController:
         self.num_envs = num_envs
         self.num_agents = num_agents
         self.device = device
-        self.max_range = max_range
+        self.max_range = torch.full(
+            (num_envs, 1), max_range, dtype=torch.float, device=device
+        )
         self.safety_factor = safety_factor
         self.radius_cap = radius_cap
         self.scan_speed = scan_speed
@@ -56,7 +58,7 @@ class MidLevelController:
             [base_position[0], base_position[1], self.RETURN_HEIGHT],
             device=device
         )
-        self.return_trigger_distance = max_range * safety_factor
+        self.return_trigger_distance = self.max_range * safety_factor
 
         # state tensors
         self.mode = torch.full(
@@ -187,3 +189,12 @@ class MidLevelController:
             dead_mask: (num_envs, num_agents) bool — True where the drone died
         """
         self.mode[dead_mask] = self.MODE_DEAD
+
+    def set_max_range(self, env_ids, values):
+        """Update max_range for specific envs. Called by env on reset.
+        Args:
+            env_ids: (N,) env indices
+            values:  (N,) new max_range values
+        """
+        self.max_range[env_ids, 0] = values
+        self.return_trigger_distance[env_ids, 0] = values * self.safety_factor

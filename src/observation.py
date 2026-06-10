@@ -85,7 +85,7 @@ class ObservationBuilder:
     # ------------------------------------------------------------------
     # ego block (14)
     # ------------------------------------------------------------------
-    def _build_ego(self, positions, velocities, yaw, modes, odometer, dist_to_base):
+    def _build_ego(self, positions, velocities, yaw, modes, odometer, dist_to_base, max_range):
         """
         All inputs per-agent flattened (A, ...), env-LOCAL coords.
             positions:    (A, 3)
@@ -104,7 +104,8 @@ class ObservationBuilder:
         heading  = self._heading_sincos(yaw)                # (A,2)
         mode_oh  = self._mode_onehot(modes)                 # (A,4)
 
-        remaining = (self.max_range - odometer) / self.arena_diagonal   # (A,)
+        
+        remaining = (max_range - odometer) / self.arena_diagonal   # (A,)
         dist_r    = dist_to_base / self.arena_diagonal                  # (A,)
 
         return torch.cat([
@@ -185,7 +186,7 @@ class ObservationBuilder:
     # top-level assembly
     # ------------------------------------------------------------------
     
-    def build(self, positions, velocities, yaw, modes, odometer, dist_to_base, env_ids, coverage_map):
+    def build(self, positions, velocities, yaw, modes, odometer, dist_to_base, env_ids, coverage_map, max_range):
         """
         Assemble the full per-agent observation vector.
 
@@ -205,7 +206,7 @@ class ObservationBuilder:
         A = positions.shape[0]
 
         # 1. ego block (14)
-        ego = self._build_ego(positions, velocities, yaw, modes, odometer, dist_to_base)
+        ego = self._build_ego(positions, velocities, yaw, modes, odometer, dist_to_base, max_range)
 
         # 2. full coverage map (100) — per-agent copy of its env's map
         full_map = coverage_map.get_full_map(env_ids)
